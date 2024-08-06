@@ -6,6 +6,7 @@ import {
   keyValueObj,
   DataType,
   SegmentState,
+  SegmentLevel,
   ImportState,
   ConsistencyLevelEnum,
   collectionNameReq,
@@ -154,10 +155,12 @@ export interface LoadBalanceReq extends GrpcTimeOut {
 
 export interface GetQuerySegmentInfoReq extends GrpcTimeOut {
   collectionName: string; // its collectioName, this is not colleciton_name :<
+  dbName?: string; // database name
 }
 
 export interface GePersistentSegmentInfoReq extends GrpcTimeOut {
   collectionName: string; // its collectioName, this is not colleciton_name:<
+  dbName?: string; // database name
 }
 
 export interface ImportReq extends collectionNameReq {
@@ -192,8 +195,10 @@ export interface QuerySegmentInfo {
   num_rows: number;
   index_name: string;
   indexID: number;
-  nodeID: number;
+  nodeID: number; // deployed node id, use nodeIds instead
   state: SegmentState;
+  nodeIds: number[];
+  level: SegmentLevel;
 }
 
 export interface PersistentSegmentInfo {
