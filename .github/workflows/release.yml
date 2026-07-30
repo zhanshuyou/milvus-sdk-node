@@ -10,6 +10,11 @@ on:
         required: true
         default: true
         type: boolean
+      npm_tag:
+        description: 'npm dist-tag to use when publishing manually'
+        required: true
+        default: 'latest'
+        type: string
 
 permissions:
   id-token: write # Required for OIDC
@@ -44,6 +49,8 @@ jobs:
           yarn build
 
       - name: Publish to npm
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.dry_run }}" = "true" ]; then
             echo "🔍 Testing npm authentication (dry run)..."
@@ -54,12 +61,17 @@ jobs:
             VERSION_TAG=$(node -p "require('./package.json').version.split('.').slice(0, 2).join('.')")
 
             echo "📦 Publishing to npm..."
-            if [ "${{ github.event.release.prerelease }}" = "true" ]; then
+            if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+              NPM_TAG="${{ inputs.npm_tag }}"
+            elif [ "${{ github.event.release.prerelease }}" = "true" ]; then
               NPM_TAG=next
-            elif [ "${{ github.event.release.make_latest }}" = "true" ]; then
-              NPM_TAG=latest
             else
-              NPM_TAG="$VERSION_TAG"
+              LATEST_RELEASE_TAG=$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq '.tag_name')
+              if [ "${{ github.event.release.tag_name }}" = "$LATEST_RELEASE_TAG" ]; then
+                NPM_TAG=latest
+              else
+                NPM_TAG="release-$VERSION_TAG"
+              fi
             fi
             echo "Publishing version $VERSION with npm dist-tag $NPM_TAG"
             npm publish --tag "$NPM_TAG"
