@@ -47,6 +47,7 @@ import {
   checkCollectionName,
   sleep,
   formatCollectionSchema,
+  formatStructArrayFieldSchema,
   formatDescribedCol,
   getDataKey,
   validatePartitionNumbers,
@@ -102,11 +103,9 @@ import {
   collectionNameReq,
 } from '../';
 
-const formatGrpcFieldSchema = (
-  field: FieldType,
-  schemaTypes: { fieldSchemaType: any }
+const formatFormattedGrpcFieldSchema = (
+  schema: Record<string, any>
 ): Record<string, any> => {
-  const schema = formatFieldSchema(field, schemaTypes);
   let defaultValue = schema.defaultValue;
   if (defaultValue) {
     defaultValue = {
@@ -133,6 +132,32 @@ const formatGrpcFieldSchema = (
     nullable: schema.nullable,
     is_function_output: schema.isFunctionOutput,
     external_field: schema.externalField,
+  };
+};
+
+const formatGrpcFieldSchema = (
+  field: FieldType,
+  schemaTypes: { fieldSchemaType: any }
+): Record<string, any> => {
+  return formatFormattedGrpcFieldSchema(formatFieldSchema(field, schemaTypes));
+};
+
+const formatGrpcStructArrayFieldSchema = (
+  field: FieldType,
+  schemaTypes: {
+    fieldSchemaType: any;
+    structArrayFieldSchemaType: any;
+  }
+): Record<string, any> => {
+  const schema = formatStructArrayFieldSchema(field, schemaTypes) as any;
+
+  return {
+    fieldID: schema.fieldID,
+    name: schema.name,
+    description: schema.description,
+    type_params: schema.typeParams,
+    nullable: schema.nullable,
+    fields: schema.fields.map(formatFormattedGrpcFieldSchema),
   };
 };
 
@@ -370,10 +395,51 @@ export class Collection extends Database {
   async addCollectionField(data: AddCollectionFieldReq): Promise<ResStatus> {
     checkCollectionName(data);
 
-    if (
-      isVectorType(convertToDataType(data.field.data_type)) &&
-      data.field.nullable !== true
-    ) {
+    const dataType = convertToDataType(data.field.data_type);
+    const elementType =
+      typeof data.field.element_type === 'undefined'
+        ? DataType.None
+        : convertToDataType(data.field.element_type);
+    const isStructArray =
+      dataType === DataType.Array && elementType === DataType.Struct;
+
+    if (isStructArray) {
+      if (data.field.nullable !== true) {
+        throw new Error(
+          ERROR_REASONS.ADD_COLLECTION_STRUCT_FIELD_NULLABLE_REQUIRED
+        );
+      }
+
+      const schemaTypes = {
+        fieldSchemaType: this.schemaProto.lookupType(
+          this.protoInternalPath.fieldSchema
+        ),
+        structArrayFieldSchemaType: this.schemaProto.lookupType(
+          this.protoInternalPath.structArrayFieldSchema
+        ),
+      };
+      const result = await promisify(
+        this.channelPool,
+        'AddCollectionStructField',
+        {
+          collection_name: data.collection_name,
+          ...(data.db_name ? { db_name: data.db_name } : {}),
+          struct_array_field_schema: formatGrpcStructArrayFieldSchema(
+            data.field,
+            schemaTypes
+          ),
+        },
+        data.timeout || this.timeout,
+        data
+      );
+
+      if (result.error_code === ErrorCode.SUCCESS) {
+        this.invalidateCollectionInfo(data);
+      }
+      return result;
+    }
+
+    if (isVectorType(dataType) && data.field.nullable !== true) {
       throw new Error(
         ERROR_REASONS.ADD_COLLECTION_FIELD_VECTOR_NULLABLE_REQUIRED
       );

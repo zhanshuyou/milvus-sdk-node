@@ -86,6 +86,43 @@ import {
 } from '../';
 import { Collection } from './Collection';
 
+// Detect function calls without treating quoted text as executable syntax.
+const hasElementFilterExpression = (expr: string): boolean => {
+  let quote: "'" | '"' | undefined;
+  let escaped = false;
+
+  for (let index = 0; index < expr.length; index++) {
+    const char = expr[index];
+
+    if (quote) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === '\\') {
+        escaped = true;
+      } else if (char === quote) {
+        quote = undefined;
+      }
+      continue;
+    }
+
+    if (char === "'" || char === '"') {
+      quote = char;
+      continue;
+    }
+
+    const previousChar = index > 0 ? expr[index - 1] : '';
+    if (/[A-Za-z0-9_]/.test(previousChar)) {
+      continue;
+    }
+
+    if (/^element_filter\b\s*\(/i.test(expr.slice(index))) {
+      return true;
+    }
+  }
+
+  return false;
+};
+
 export class Data extends Collection {
   /**
    * Upsert data into Milvus, view _insert for detail
@@ -403,6 +440,10 @@ export class Data extends Collection {
             break;
 
           case DataType.ArrayOfVector: {
+            const vectorRows =
+              field.nullable === true
+                ? field.data.filter(v => v !== undefined && v !== null)
+                : field.data;
             const buildVectorArrayData = (vector: any) => {
               switch (field.elementType) {
                 case DataType.FloatVector:
@@ -449,7 +490,7 @@ export class Data extends Collection {
             keyValue = {
               [dataKey]: {
                 dim: field.dim,
-                data: field.data.map(buildVectorArrayData),
+                data: vectorRows.map(buildVectorArrayData),
                 element_type: field.elementType,
               },
             };
@@ -552,8 +593,7 @@ export class Data extends Collection {
 
       if (typeof op === 'number') {
         const opName = FieldPartialUpdateOpType[op] as
-          | keyof typeof FieldPartialUpdateOpType
-          | undefined;
+          keyof typeof FieldPartialUpdateOpType | undefined;
         if (typeof opName === 'undefined') {
           throw new Error(`unsupported field partial update op: ${op}`);
         }
@@ -829,9 +869,9 @@ export class Data extends Collection {
       ? formatSearchAggregationResult(originSearchResult)
       : undefined;
     const formattedAggBuckets = aggBuckets
-      ? ((nq === 1 ? aggBuckets[0] || [] : aggBuckets) as SearchResults<T>[
-          'agg_buckets'
-        ])
+      ? ((nq === 1
+          ? aggBuckets[0] || []
+          : aggBuckets) as SearchResults<T>['agg_buckets'])
       : undefined;
 
     return {
@@ -846,9 +886,7 @@ export class Data extends Collection {
         originSearchResult.results.search_iterator_v2_results,
       _search_iterator_v2_results:
         originSearchResult.results._search_iterator_v2_results,
-      ...(formattedAggBuckets
-        ? { agg_buckets: formattedAggBuckets }
-        : {}),
+      ...(formattedAggBuckets ? { agg_buckets: formattedAggBuckets } : {}),
     };
   }
 
@@ -967,12 +1005,20 @@ export class Data extends Collection {
    * }
    */
   async queryIterator(data: QueryIteratorReq): Promise<any> {
-    // get collection info
-    const pkField = await this.getPkField(data);
     // store client;
     const client = this;
     // expr
     const userExpr = data.expr || data.filter || '';
+    const isElementFilter = hasElementFilterExpression(userExpr);
+    const collectionInfo = isElementFilter
+      ? await this.describeCollection({
+          collection_name: data.collection_name,
+          db_name: data.db_name,
+        })
+      : undefined;
+    const pkField = isElementFilter
+      ? collectionInfo!.schema.fields.find(field => field.is_primary_key)!
+      : await this.getPkField(data);
     // get count
     const count = await client.count({
       collection_name: data.collection_name,
@@ -995,10 +1041,18 @@ export class Data extends Collection {
         : queryData.batchSize;
 
     // local variables
-    let expr = userExpr;
-    let lastBatchRes: Record<string, any> = [];
-    let lastPKId: string | number = '';
+    const expr = userExpr;
+    let lastBatchRes: RowData[] = [];
+    let lastPKId: string | number | undefined;
+    let lastElementOffset: string | number | undefined;
     let currentBatchSize = batchSize; // Store the current batch size
+    const iteratorParams: Record<string, any> | undefined = isElementFilter
+      ? {
+          ...data.params,
+          iterator: true,
+          collection_id: collectionInfo!.collectionID,
+        }
+      : undefined;
 
     // return iterator
     return {
@@ -1019,15 +1073,32 @@ export class Data extends Collection {
               expr: expr,
               pkField,
               lastPKId,
+              lastElementOffset,
             });
+            if (iteratorParams) {
+              queryData.params = { ...iteratorParams };
+              if (
+                typeof lastPKId !== 'undefined' &&
+                typeof lastElementOffset !== 'undefined'
+              ) {
+                queryData.params.query_iter_last_pk = lastPKId;
+                queryData.params.query_iter_last_element_offset =
+                  lastElementOffset;
+              }
+            }
 
             // search data
             const res = await client.query(queryData as QueryReq);
+
+            if (!res.data.length) {
+              return { done: true, value: null };
+            }
 
             // get last item of the data
             const lastItem = res.data[res.data.length - 1];
             // update last pk id
             lastPKId = lastItem && lastItem[pkField.name];
+            lastElementOffset = isElementFilter ? lastItem?.offset : undefined;
 
             // store last batch result
             lastBatchRes = res.data;
@@ -1146,7 +1217,7 @@ export class Data extends Collection {
    * @param {string[]} [data.group_by_fields] - Scalar fields used to group aggregation results. Aggregation expressions such as `count(*)`, `min(price)`, `max(price)`, `sum(price)`, and `avg(price)` are specified in `output_fields`.
    * @param {OrderByFields} [data.order_by_fields] - Fields to sort query results by, for example `price:asc` or `[{ field: 'price', order: 'asc' }]` (optional).
    * @param {OrderByFields} [data.order_by] - Alias for data.order_by_fields (optional).
-   * @param {{key: value}[]} [data.params] - An optional key pair json array of search parameters.
+   * @param {Record<string, unknown>} [data.params] - Additional query parameters as a key-value object.
    * @param {OutputTransformers} data.transformers - The transformers for bf16 or f16 data, it accept bytes or sparse dic vector, it can ouput f32 array or other format(optional)
    *
    * @returns {Promise<QueryResults>} The result of the operation.
@@ -1178,7 +1249,11 @@ export class Data extends Collection {
       offset = { offset: data.offset };
     }
 
-    const queryParams: { [key: string]: any } = { ...limits, ...offset };
+    const queryParams: { [key: string]: any } = {
+      ...data.params,
+      ...limits,
+      ...offset,
+    };
     if (data.group_by_fields !== undefined) {
       if (!Array.isArray(data.group_by_fields)) {
         throw new Error('Invalid group_by_fields format');
