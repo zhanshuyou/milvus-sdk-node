@@ -798,6 +798,7 @@ type TemplateValue =
   | { int64_val: number }
   | { float_val: number }
   | { string_val: string }
+  | { bytes_val: Uint8Array }
   | { array_val: TemplateArrayValue };
 
 type TemplateArrayValue =
@@ -814,9 +815,20 @@ export const formatExprValues = (
   const result: Record<string, TemplateValue> = {};
 
   for (const [key, value] of Object.entries(exprValues)) {
+    if (value === undefined) {
+      // A key whose value is undefined means "not provided" in JavaScript -- `{...opts, x:
+      // maybeMissing}` is routine -- so it is skipped rather than rejected. Everything else,
+      // including null, is a value the caller wrote deliberately and has to be representable.
+      continue;
+    }
     if (Array.isArray(value)) {
       // Handle arrays
       result[key] = { array_val: convertArray(value) };
+    } else if (value instanceof Uint8Array) {
+      // A client pre-built filter blob (see buildBloomFilter) travels as raw bytes: proto3
+      // bytes has no UTF-8 constraint, so a multi-MB blob rides the wire with zero base64
+      // inflation. Buffer is a Uint8Array subclass, so it lands here too.
+      result[key] = { bytes_val: value };
     } else {
       // Handle primitive types
       if (typeof value === 'boolean') {
@@ -827,6 +839,15 @@ export const formatExprValues = (
           : { float_val: value };
       } else if (typeof value === 'string') {
         result[key] = { string_val: value };
+      } else {
+        // Previously an unsupported type fell through silently and the key was dropped from
+        // the request, so the query ran without that template value instead of failing --
+        // the server then reported a confusing "template variable not found" at best.
+        throw new Error(
+          `Unsupported expr value type for key "${key}": ${
+            value === null ? 'null' : typeof value
+          }`
+        );
       }
     }
   }
